@@ -1,0 +1,11 @@
+numpy
+pandas
+matplotlib
+tqdm
+opencv-python
+onnxruntime
+scikit-learn
+jupyter
+streamlit
+joblib
+pillow
