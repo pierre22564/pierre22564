@@ -1,6 +1,6 @@
 # Privacy-Preserving Face Recognition
 
-Face-recognition project built around ArcFace, LFW, image degradation, embedding anonymization, unknown-user rejection, and automatic benchmarking.
+Face-recognition project built around ArcFace, LFW, anonymization at the image or embedding level, known-user matching, unknown-user rejection, and differential privacy sweeps.
 
 ## Main entry points
 
@@ -10,17 +10,27 @@ Face-recognition project built around ArcFace, LFW, image degradation, embedding
 
 ## What the app does
 
-- Browse LFW samples
-- Match known users and compute accuracy
-- Test unknown or out-of-distribution images
-- Sweep differential privacy levels with different `epsilon` values
-- Try other anonymization methods:
-  - noise injection
-  - random projection
-  - quantization
-  - cancellable transformations
-- Run an automatic benchmark across several methods
-- Save and reopen experiment results
+The Streamlit GUI is intentionally limited to the three requested tasks:
+
+- `1. Known Users Accuracy`
+  - run one sample match
+  - compute matching accuracy on a subset of known users
+  - run a blur sweep and plot accuracy versus blur level
+- `2. Unknown / OOD Check`
+  - test a human image not present in the dataset
+  - test an out-of-distribution animal image
+  - test excluded LFW identities
+- `3. Differential Privacy Sweeps`
+  - evaluate Laplace noise on embeddings for several `epsilon` values
+  - compare utility on known users and rejection on unknown users
+
+Available anonymization methods in the GUI:
+
+- Gaussian blur
+- Noise injection
+- Random projection
+- Quantization
+- Cancellable transformation
 
 ## Quick start
 
@@ -57,13 +67,12 @@ Then run:
 streamlit run app/streamlit_app.py
 ```
 
-## External sample image
+## Bundled external samples
 
-The repo includes one external sample image not present in the local LFW dataset:
+The repo includes two ready-to-use samples for the unknown / OOD section:
 
 - `sample_inputs/greta_thunberg_unknown.jpg`
-
-This is useful for the unknown-user section of the GUI.
+- `sample_inputs/cat_ood.jpg`
 
 ## Persistence
 
@@ -88,3 +97,4 @@ These folders are excluded from Git by default.
 
 - The GUI uses cached embeddings and a cached classifier when available.
 - If you want a fresh recomputation, delete the files inside `artifacts/`.
+- The slide notes for the anonymization methods are in `docs/anonymization_methods.md`.

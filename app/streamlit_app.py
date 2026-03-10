@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import json
 import sys
+import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -76,6 +78,7 @@ st.markdown(
         font-size: 1.55rem;
         font-weight: 700;
         color: var(--ink);
+        word-break: break-word;
       }
       .section-card {
         padding: 0.95rem 1rem;
@@ -90,17 +93,35 @@ st.markdown(
 )
 
 
-KNOWN_METHODS = list(METHOD_SPECS.keys())
-DP_METHODS = ["laplace_noise", "embedding_dp_laplace"]
-OTHER_METHODS = ["gaussian_noise", "gaussian_blur", "blur_plus_noise", "embedding_noise", "random_projection", "quantization", "cancellable_transform"]
-BENCHMARK_CONFIGS = {
-    "embedding_noise": {"parameter_name": "sigma", "values": [0.01, 0.03, 0.05, 0.1, 0.15], "base_params": {}},
-    "random_projection": {"parameter_name": "target_dim", "values": [512, 256, 128, 64, 32], "base_params": {"seed": 42}},
-    "quantization": {"parameter_name": "levels", "values": [256, 128, 64, 32, 16, 8], "base_params": {}},
-    "cancellable_transform": {"parameter_name": "mix_ratio", "values": [0.2, 0.4, 0.6, 0.8, 1.0], "base_params": {"seed": 42}},
+ANONYMIZATION_METHODS = [
+    "gaussian_blur",
+    "embedding_noise",
+    "random_projection",
+    "quantization",
+    "cancellable_transform",
+]
+
+METHOD_LABELS = {
+    "gaussian_blur": "Gaussian Blur",
+    "embedding_noise": "Noise Injection",
+    "random_projection": "Random Projection",
+    "quantization": "Quantization",
+    "cancellable_transform": "Cancellable Transformation",
+    "embedding_dp_laplace": "Differential Privacy (Laplace on embedding)",
 }
+
+UI_PARAM_FIELDS = {
+    "gaussian_blur": ["kernel_size"],
+    "embedding_noise": ["sigma"],
+    "random_projection": ["target_dim"],
+    "quantization": ["levels"],
+    "cancellable_transform": ["mix_ratio"],
+    "embedding_dp_laplace": ["epsilon", "sensitivity"],
+}
+
 BUNDLED_EXTERNAL_IMAGES = {
-    "Greta Thunberg (Wikimedia Commons, not in LFW)": PROJECT_ROOT / "sample_inputs" / "greta_thunberg_unknown.jpg",
+    "Greta Thunberg (human, not in LFW)": PROJECT_ROOT / "sample_inputs" / "greta_thunberg_unknown.jpg",
+    "Cat image (OOD animal sample)": PROJECT_ROOT / "sample_inputs" / "cat_ood.jpg",
 }
 
 
@@ -133,10 +154,15 @@ def render_section_header(title: str, subtitle: str) -> None:
     )
 
 
+def method_label(method: str) -> str:
+    return METHOD_LABELS.get(method, method)
+
+
 def render_param_inputs(method: str, prefix: str) -> dict[str, float | int]:
     spec = METHOD_SPECS[method]
     params: dict[str, float | int] = {}
-    for name, default in spec.default_params.items():
+    for name in UI_PARAM_FIELDS.get(method, list(spec.default_params.keys())):
+        default = spec.default_params[name]
         key = f"{prefix}_{method}_{name}"
         if isinstance(default, int):
             max_value = max(default * 4, 10)
@@ -170,6 +196,87 @@ def dataframe_download(df: pd.DataFrame, filename: str) -> tuple[bytes, str]:
     return df.to_csv(index=False).encode("utf-8"), filename
 
 
+def add_overall_success_rate(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy()
+    if {"top1_accuracy", "rejection_rate"}.issubset(enriched.columns):
+        enriched["overall_success_rate"] = enriched["top1_accuracy"] * (1.0 - enriched["rejection_rate"])
+    return enriched
+
+
+def init_ui_state() -> None:
+    st.session_state.setdefault("activity_log", [])
+    st.session_state.setdefault("current_action", None)
+    st.session_state.setdefault("last_error", None)
+    st.session_state.setdefault("last_success", None)
+
+
+def log_activity(level: str, message: str, duration: float | None = None, details: str | None = None) -> None:
+    entry = {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "level": level,
+        "message": message,
+        "duration": duration,
+        "details": details,
+    }
+    log = st.session_state.get("activity_log", [])
+    log.insert(0, entry)
+    st.session_state["activity_log"] = log[:20]
+
+
+def run_ui_action(label: str, action):
+    start = time.perf_counter()
+    st.session_state["current_action"] = label
+    st.session_state["last_error"] = None
+    log_activity("info", f"Started: {label}")
+    status = st.status(label, expanded=True)
+    status.write("Running...")
+    try:
+        result = action(status)
+        duration = time.perf_counter() - start
+        status.update(label=f"{label} completed", state="complete", expanded=False)
+        status.write(f"Completed in {duration:.2f}s")
+        st.session_state["last_success"] = {"label": label, "duration": duration}
+        log_activity("success", f"Completed: {label}", duration=duration)
+        return result
+    except Exception:
+        duration = time.perf_counter() - start
+        tb = traceback.format_exc()
+        st.session_state["last_error"] = {"label": label, "duration": duration, "traceback": tb}
+        status.update(label=f"{label} failed", state="error", expanded=True)
+        status.write(f"Failed after {duration:.2f}s")
+        status.code(tb, language="python")
+        log_activity("error", f"Failed: {label}", duration=duration, details=tb)
+        st.error(f"{label} failed. See the error details below.")
+        with st.expander("Error details", expanded=True):
+            st.code(tb, language="python")
+        return None
+    finally:
+        st.session_state["current_action"] = None
+
+
+def render_activity_console() -> None:
+    st.subheader("System Console")
+    current_action = st.session_state.get("current_action")
+    if current_action:
+        st.warning(f"Current action: {current_action}")
+    else:
+        st.success("Idle")
+
+    last_success = st.session_state.get("last_success")
+    if last_success:
+        st.caption(f"Last completed action: {last_success['label']} in {last_success['duration']:.2f}s")
+
+    last_error = st.session_state.get("last_error")
+    if last_error:
+        st.error(f"Last error: {last_error['label']} after {last_error['duration']:.2f}s")
+        with st.expander("Last error traceback", expanded=False):
+            st.code(last_error["traceback"], language="python")
+
+    for entry in st.session_state.get("activity_log", [])[:8]:
+        suffix = f" ({entry['duration']:.2f}s)" if entry["duration"] is not None else ""
+        st.caption(f"[{entry['time']}] {entry['level'].upper()} - {entry['message']}{suffix}")
+
+
 def choose_dataset_test_sample(pipeline: PrivacyFacePipeline, key: str) -> tuple[np.ndarray, str, str]:
     test_frame = pipeline.dataset.frame.iloc[pipeline.test_idx].copy()
     test_frame["display"] = (
@@ -186,10 +293,10 @@ def choose_dataset_test_sample(pipeline: PrivacyFacePipeline, key: str) -> tuple
 def choose_unknown_source(pipeline: PrivacyFacePipeline, prefix: str) -> tuple[np.ndarray | None, str | None]:
     mode = st.radio(
         "Unknown source",
-        ["Bundled external sample", "Excluded LFW identity", "Upload image"],
+        ["Bundled sample", "Excluded LFW identity", "Upload image"],
         key=f"{prefix}_unknown_mode",
     )
-    if mode == "Bundled external sample":
+    if mode == "Bundled sample":
         selected_label = st.selectbox("Bundled sample", list(BUNDLED_EXTERNAL_IMAGES.keys()), key=f"{prefix}_bundled")
         path = BUNDLED_EXTERNAL_IMAGES[selected_label]
         return np.asarray(Image.open(path).convert("RGB")), str(path)
@@ -204,14 +311,24 @@ def choose_unknown_source(pipeline: PrivacyFacePipeline, prefix: str) -> tuple[n
 
 
 def render_query_result(result: QueryResult) -> None:
+    top_cols = st.columns(4)
+    with top_cols[0]:
+        render_metric_card("Predicted identity", result.predicted_label.replace("_", " "))
+    with top_cols[1]:
+        render_metric_card("Nearest label", result.matched_label.replace("_", " "))
+    with top_cols[2]:
+        render_metric_card("Cosine distance", f"{result.predicted_distance:.3f}")
+    with top_cols[3]:
+        render_metric_card("Decision", "Matched" if result.is_known else "Rejected")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         st.image(result.query_image, caption="Original image", use_container_width=True)
     with c2:
         if result.protected_image is not None:
-            st.image(result.protected_image, caption=f"Protected image ({result.method})", use_container_width=True)
+            st.image(result.protected_image, caption=f"Protected image ({method_label(result.method)})", use_container_width=True)
         else:
-            st.pyplot(make_heatmap_figure(result.query_embedding, f"{result.method} embedding"), clear_figure=True)
+            st.pyplot(make_heatmap_figure(result.query_embedding, f"{method_label(result.method)} embedding"), clear_figure=True)
     with c3:
         st.image(str(result.matched_image_path), caption=f"Best match: {result.matched_label.replace('_', ' ')}", use_container_width=True)
 
@@ -238,7 +355,13 @@ def render_method_reference(method: str) -> None:
             st.markdown(f"- [{source['label']}]({source['url']})")
 
 
-def compute_unknown_summary(pipeline: PrivacyFacePipeline, method: str, params: dict[str, float | int], threshold: float, count: int) -> tuple[pd.DataFrame, float]:
+def compute_unknown_summary(
+    pipeline: PrivacyFacePipeline,
+    method: str,
+    params: dict[str, float | int],
+    threshold: float,
+    count: int,
+) -> tuple[pd.DataFrame, float]:
     unknown_df = pipeline.evaluate_unknown_images(
         image_paths=pipeline.sample_unknown_paths(count=count),
         method=method,
@@ -254,8 +377,8 @@ def render_overview_section(pipeline: PrivacyFacePipeline) -> None:
     st.markdown('<div class="hero">', unsafe_allow_html=True)
     st.title("Privacy-Preserving Face Recognition")
     st.write(
-        "Single GUI for ArcFace, LFW, differential privacy sweeps, embedding anonymization, "
-        "known-user matching, unknown-user rejection, and automatic benchmarking."
+        "This interface is limited to the three requested tasks: known-user matching accuracy, unknown or OOD rejection, "
+        "and differential privacy sweeps over epsilon."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -271,56 +394,116 @@ def render_overview_section(pipeline: PrivacyFacePipeline) -> None:
         with col:
             render_metric_card(label, value)
 
-    render_section_header(
-        "Current workflow",
-        "Use the sections in the left sidebar to run one task at a time: known users, unknown users, DP sweeps, other anonymization methods, then the automatic benchmark.",
+    method_cols = st.columns(len(ANONYMIZATION_METHODS) + 1)
+    method_values = [
+        ("Method 1", method_label("gaussian_blur")),
+        ("Method 2", method_label("embedding_noise")),
+        ("Method 3", method_label("random_projection")),
+        ("Method 4", method_label("quantization")),
+        ("Method 5", method_label("cancellable_transform")),
+        ("DP mode", method_label("embedding_dp_laplace")),
+    ]
+    for col, (label, value) in zip(method_cols, method_values):
+        with col:
+            render_metric_card(label, value)
+
+    st.caption(
+        f"Embeddings cache: {pipeline.config.embeddings_cache_path} | "
+        f"Classifier cache: {pipeline.config.classifier_cache_path} | "
+        f"Experiments folder: {pipeline.config.experiments_dir}"
     )
-
-    st.subheader("Dataset preview")
-    grid = pipeline.get_sample_paths()
-    preview_cols = st.columns(len(grid))
-    for col, paths in zip(preview_cols, grid):
-        if not paths:
-            continue
-        col.caption(Path(paths[0]).parent.name.replace("_", " "))
-        for path in paths:
-            col.image(str(path), use_container_width=True)
-
-    st.subheader("Persistent artifacts")
-    st.write(f"Embeddings cache: `{pipeline.config.embeddings_cache_path}`")
-    st.write(f"Classifier cache: `{pipeline.config.classifier_cache_path}`")
-    st.write(f"Experiments folder: `{pipeline.config.experiments_dir}`")
 
 
 def render_known_users_section(pipeline: PrivacyFacePipeline) -> None:
     render_section_header(
         "Section 1",
-        "Repeat matching using photos from different users and compute the accuracy of the ML method.",
+        "Repeat the matching using photos from different users and compute the accuracy of the ML method.",
     )
     left, right = st.columns([1, 2])
     with left:
-        st.info("Change the controls, then press the main button. Heavy actions show a spinner and keep the last result visible below.")
-        method = st.selectbox("Method", KNOWN_METHODS, key="known_method")
+        st.info("Choose one anonymization method, run one visual example, then compute the accuracy on multiple known users from the dataset.")
+        method = st.selectbox(
+            "Anonymization method",
+            ANONYMIZATION_METHODS,
+            format_func=method_label,
+            key="known_method",
+        )
         params = render_param_inputs(method, prefix="known")
         threshold = st.slider("Known-user threshold", 0.0, 1.0, float(pipeline.threshold), 0.01, key="known_threshold")
-        limit = st.slider("Number of test samples", 50, len(pipeline.test_idx), min(300, len(pipeline.test_idx)), 10, key="known_limit")
+        limit = st.slider("Number of test samples", 20, len(pipeline.test_idx), min(20, len(pipeline.test_idx)), 10, key="known_limit")
         sample_rgb, known_label, source_name = choose_dataset_test_sample(pipeline, key="known_sample")
 
         if st.button("Run sample match", key="known_match_button", use_container_width=True):
-            with st.spinner("Running sample match..."):
-                st.session_state["known_query_result"] = pipeline.query_image(
+
+            def _run_known_sample(status):
+                status.write("Preparing query image...")
+                result = pipeline.query_image(
                     image_rgb=sample_rgb,
                     method=method,
                     params=params,
                     known_label=known_label,
                     threshold=threshold,
                 )
+                status.write("Matching completed.")
+                st.session_state["known_query_result"] = result
                 st.session_state["known_query_source"] = source_name
 
+            run_ui_action("Known-user sample match", _run_known_sample)
+
         if st.button("Compute accuracy", key="known_eval_button", type="primary", use_container_width=True):
-            with st.spinner("Computing matching accuracy on known users..."):
+
+            def _run_known_eval(status):
+                status.write(f"Evaluating {limit} known-user samples...")
                 result = pipeline.evaluate_method(method=method, params=params, threshold=threshold, limit=limit)
+                status.write(f"Top-1 accuracy: {result.top1_accuracy:.3f}")
                 st.session_state["known_eval_result"] = result
+                st.session_state["known_eval_payload"] = {
+                    "type": "known_users_accuracy",
+                    "method": method,
+                    "params": params,
+                    "threshold": threshold,
+                    "result": result.__dict__,
+                }
+
+            run_ui_action("Known-user accuracy evaluation", _run_known_eval)
+
+        st.divider()
+        st.markdown("**Blur accuracy sweep**")
+        st.caption(
+            "Run an automatic blur experiment on multiple known users. "
+            "The app increases the blur level and plots how the matching accuracy changes."
+        )
+        blur_values_text = st.text_input(
+            "Blur kernel sizes",
+            "1,5,11,21,31,41,61,81",
+            key="known_blur_values",
+        )
+        if st.button("Run blur accuracy sweep", key="known_blur_sweep_button", use_container_width=True):
+
+            def _run_blur_sweep(status):
+                kernel_sizes = [int(item.strip()) for item in blur_values_text.split(",") if item.strip()]
+                kernel_sizes = [value if value % 2 == 1 else value + 1 for value in kernel_sizes]
+                status.write(f"Testing Gaussian Blur on {limit} known-user samples...")
+                sweep_df = pipeline.run_parameter_sweep(
+                    method="gaussian_blur",
+                    parameter_name="kernel_size",
+                    parameter_values=kernel_sizes,
+                    threshold=threshold,
+                    limit=limit,
+                )
+                sweep_df = add_overall_success_rate(sweep_df)
+                st.session_state["known_blur_sweep_df"] = sweep_df
+                st.session_state["known_blur_sweep_payload"] = {
+                    "type": "known_user_blur_sweep",
+                    "method": "gaussian_blur",
+                    "threshold": threshold,
+                    "num_samples": limit,
+                    "rows": sweep_df.to_dict(orient="records"),
+                }
+                status.write("Blur sweep completed.")
+
+            run_ui_action("Known-user blur accuracy sweep", _run_blur_sweep)
+
         render_method_reference(method)
 
     with right:
@@ -328,6 +511,7 @@ def render_known_users_section(pipeline: PrivacyFacePipeline) -> None:
         if isinstance(result, QueryResult):
             st.write(f"Sample source: `{st.session_state.get('known_query_source')}`")
             render_query_result(result)
+
         eval_result = st.session_state.get("known_eval_result")
         if eval_result is not None:
             c1, c2, c3, c4 = st.columns(4)
@@ -339,45 +523,92 @@ def render_known_users_section(pipeline: PrivacyFacePipeline) -> None:
                 render_metric_card("Mean distance", f"{eval_result.mean_distance:.3f}")
             with c4:
                 render_metric_card("Rejected", f"{eval_result.num_rejected}/{eval_result.num_samples}")
-            st.caption("Save accuracy result writes a JSON summary into the experiments folder.")
-            if st.button("Save accuracy result", key="known_save_result"):
-                saved = pipeline.save_experiment(
-                    "known_users_accuracy",
-                    {"type": "known_users_accuracy", "result": eval_result.__dict__},
-                )
+            st.caption("Save result writes the known-user accuracy summary into the experiments folder.")
+            if st.button("Save known-user result", key="known_save_result"):
+                saved = pipeline.save_experiment("known_users_accuracy", st.session_state["known_eval_payload"])
+                st.success(f"Saved to {saved}")
+
+        blur_sweep_df = st.session_state.get("known_blur_sweep_df")
+        if isinstance(blur_sweep_df, pd.DataFrame):
+            st.markdown("**Blur sweep results**")
+            st.dataframe(blur_sweep_df, use_container_width=True)
+            chart_df = blur_sweep_df.set_index("parameter_value")[["overall_success_rate", "top1_accuracy", "rejection_rate"]]
+            chart_df.index.name = "kernel_size"
+            st.line_chart(chart_df)
+            st.caption(
+                "Interpretation: `overall_success_rate` is the most important curve here, because it counts rejected images as failures. "
+                "As the blur kernel increases, this curve should eventually collapse toward zero."
+            )
+            csv_data, csv_name = dataframe_download(blur_sweep_df, "known_user_blur_sweep.csv")
+            st.download_button(
+                "Download blur sweep CSV",
+                data=csv_data,
+                file_name=csv_name,
+                mime="text/csv",
+                key="known_blur_download",
+            )
+            if st.button("Save blur sweep", key="known_blur_save"):
+                saved = pipeline.save_experiment("known_user_blur_sweep", st.session_state["known_blur_sweep_payload"])
                 st.success(f"Saved to {saved}")
 
 
 def render_unknown_section(pipeline: PrivacyFacePipeline) -> None:
     render_section_header(
         "Section 2",
-        "Use a photo of a person not in the database, or an external image, and check whether it is identified or rejected.",
+        "Use a photo of a person not in the dataset, or an out-of-distribution sample such as an animal photo, and check whether it is identified or rejected.",
     )
     left, right = st.columns([1, 2])
     with left:
-        st.info("Use this section for a person outside the database or for a truly external image. If the distance is above the threshold, the system should reject it.")
-        method = st.selectbox("Method", KNOWN_METHODS, key="unknown_method_main")
-        params = render_param_inputs(method, prefix="unknown_main")
-        threshold = st.slider("Unknown-user threshold", 0.0, 1.0, float(pipeline.threshold), 0.01, key="unknown_threshold_main")
-        image_rgb, source_name = choose_unknown_source(pipeline, prefix="unknown_main")
+        st.info("This section supports a bundled human unknown sample, a bundled animal OOD sample, excluded LFW identities, or your own upload.")
+        method = st.selectbox(
+            "Anonymization method",
+            ANONYMIZATION_METHODS,
+            format_func=method_label,
+            key="unknown_method",
+        )
+        params = render_param_inputs(method, prefix="unknown")
+        threshold = st.slider("Unknown-user threshold", 0.0, 1.0, float(pipeline.threshold), 0.01, key="unknown_threshold")
+        image_rgb, source_name = choose_unknown_source(pipeline, prefix="unknown")
         batch_count = st.slider("Batch size for excluded LFW users", 5, 40, 20, 5, key="unknown_batch_count")
 
-        if st.button("Check one unknown image", key="unknown_single_button", type="primary", use_container_width=True) and image_rgb is not None:
-            with st.spinner("Checking whether the unknown image is matched or rejected..."):
-                st.session_state["unknown_single_result"] = pipeline.query_image(
-                    image_rgb=image_rgb,
-                    method=method,
-                    params=params,
-                    known_label=None,
-                    threshold=threshold,
-                )
-                st.session_state["unknown_single_source"] = source_name
+        if st.button("Check one unknown image", key="unknown_single_button", type="primary", use_container_width=True):
+            if image_rgb is None:
+                st.warning("Select or upload an image first.")
+            else:
+
+                def _run_unknown_single(status):
+                    status.write("Computing embedding and nearest match...")
+                    result = pipeline.query_image(
+                        image_rgb=image_rgb,
+                        method=method,
+                        params=params,
+                        known_label=None,
+                        threshold=threshold,
+                    )
+                    status.write(f"Predicted label: {result.predicted_label}")
+                    st.session_state["unknown_single_result"] = result
+                    st.session_state["unknown_single_source"] = source_name
+
+                run_ui_action("Unknown single-image check", _run_unknown_single)
 
         if st.button("Run batch rejection test", key="unknown_batch_button", use_container_width=True):
-            with st.spinner("Running batch rejection test on unknown identities..."):
+
+            def _run_unknown_batch(status):
+                status.write(f"Testing {batch_count} unknown samples...")
                 unknown_df, rejection_rate = compute_unknown_summary(pipeline, method, params, threshold, batch_count)
+                status.write(f"Unknown rejection rate: {rejection_rate:.3f}")
                 st.session_state["unknown_batch_df"] = unknown_df
                 st.session_state["unknown_batch_rate"] = rejection_rate
+                st.session_state["unknown_batch_payload"] = {
+                    "type": "unknown_user_check",
+                    "method": method,
+                    "params": params,
+                    "threshold": threshold,
+                    "rows": unknown_df.to_dict(orient="records"),
+                }
+
+            run_ui_action("Unknown batch rejection test", _run_unknown_batch)
+
         render_method_reference(method)
 
     with right:
@@ -385,10 +616,15 @@ def render_unknown_section(pipeline: PrivacyFacePipeline) -> None:
         if isinstance(single_result, QueryResult):
             st.write(f"Source: `{st.session_state.get('unknown_single_source')}`")
             render_query_result(single_result)
+
         batch_df = st.session_state.get("unknown_batch_df")
         if isinstance(batch_df, pd.DataFrame):
             render_metric_card("Unknown rejection rate", f"{st.session_state.get('unknown_batch_rate', 0.0):.3f}")
             st.dataframe(batch_df, use_container_width=True)
+            st.caption("Save result writes the unknown-user rejection table into the experiments folder.")
+            if st.button("Save unknown-user result", key="unknown_save_button"):
+                saved = pipeline.save_experiment("unknown_user_check", st.session_state["unknown_batch_payload"])
+                st.success(f"Saved to {saved}")
 
 
 def render_dp_section(pipeline: PrivacyFacePipeline) -> None:
@@ -398,13 +634,9 @@ def render_dp_section(pipeline: PrivacyFacePipeline) -> None:
     )
     left, right = st.columns([1, 2])
     with left:
-        st.info("Privacy levels here are the epsilon values. Smaller epsilon means stronger privacy and usually lower utility.")
-        dp_method = st.radio(
-            "DP mode",
-            options=DP_METHODS,
-            format_func=lambda value: "Image Laplace noise" if value == "laplace_noise" else "Embedding Laplace noise",
-            key="dp_method",
-        )
+        st.info("Smaller epsilon means stronger privacy, more injected Laplace noise, and usually lower recognition performance.")
+        dp_method = "embedding_dp_laplace"
+        st.caption(f"DP mode used here: {method_label(dp_method)}")
         base_params = render_param_inputs(dp_method, prefix="dp")
         threshold = st.slider("DP threshold", 0.0, 1.0, float(pipeline.threshold), 0.01, key="dp_threshold")
         limit = st.slider("Known-user sample count", 50, len(pipeline.test_idx), min(250, len(pipeline.test_idx)), 10, key="dp_limit")
@@ -412,17 +644,20 @@ def render_dp_section(pipeline: PrivacyFacePipeline) -> None:
         raw_values = st.text_input("Epsilon values", "1,2,4,8,16", key="dp_eps_values")
 
         if st.button("Run DP sweep", key="dp_run_button", type="primary", use_container_width=True):
-            with st.spinner("Running differential privacy sweep across epsilon values..."):
+
+            def _run_dp_sweep(status):
                 epsilon_values = [float(item.strip()) for item in raw_values.split(",") if item.strip()]
                 rows: list[dict[str, float | int | str]] = []
-                for epsilon in epsilon_values:
+                progress = st.progress(0, text="Starting DP sweep...")
+                for index, epsilon in enumerate(epsilon_values, start=1):
+                    progress.progress(index / len(epsilon_values), text=f"Testing epsilon = {epsilon}")
+                    status.write(f"Running epsilon = {epsilon}")
                     params = dict(base_params)
                     params["epsilon"] = epsilon
                     known_result = pipeline.evaluate_method(dp_method, params=params, threshold=threshold, limit=limit)
                     _, unknown_rejection_rate = compute_unknown_summary(pipeline, dp_method, params, threshold, unknown_count)
                     rows.append(
                         {
-                            "method": dp_method,
                             "epsilon": epsilon,
                             "known_top1_accuracy": known_result.top1_accuracy,
                             "known_rejection_rate": known_result.rejection_rate,
@@ -430,7 +665,20 @@ def render_dp_section(pipeline: PrivacyFacePipeline) -> None:
                             "mean_distance": known_result.mean_distance,
                         }
                     )
-                st.session_state["dp_sweep_df"] = pd.DataFrame(rows)
+                progress.empty()
+                sweep_df = pd.DataFrame(rows)
+                st.session_state["dp_sweep_df"] = sweep_df
+                st.session_state["dp_sweep_payload"] = {
+                    "type": "dp_sweep",
+                    "method": dp_method,
+                    "base_params": base_params,
+                    "threshold": threshold,
+                    "rows": sweep_df.to_dict(orient="records"),
+                }
+                status.write("DP sweep finished.")
+
+            run_ui_action("Differential privacy sweep", _run_dp_sweep)
+
         render_method_reference(dp_method)
 
     with right:
@@ -440,195 +688,44 @@ def render_dp_section(pipeline: PrivacyFacePipeline) -> None:
             st.line_chart(sweep_df.set_index("epsilon")[["known_top1_accuracy", "unknown_rejection_rate"]])
             data, filename = dataframe_download(sweep_df, "dp_sweep.csv")
             st.download_button("Download DP sweep CSV", data=data, file_name=filename, mime="text/csv")
-            st.caption("Save DP sweep writes the epsilon table into the experiments folder.")
+            st.caption("Save result writes the DP epsilon sweep into the experiments folder.")
             if st.button("Save DP sweep", key="dp_save_button"):
-                saved = pipeline.save_experiment("dp_sweep", {"type": "dp_sweep", "rows": sweep_df.to_dict(orient="records")})
+                saved = pipeline.save_experiment("dp_sweep", st.session_state["dp_sweep_payload"])
                 st.success(f"Saved to {saved}")
-
-
-def render_other_methods_section(pipeline: PrivacyFacePipeline) -> None:
-    render_section_header(
-        "Section 4",
-        "Choose another anonymization method, select an image, apply the protection, and inspect the visual or embedding-level effect with the retrieved match.",
-    )
-    left, right = st.columns([1, 2])
-    with left:
-        st.info("This is the manual single-image demo. Choose one method, one image, and inspect the visual result plus the retrieved identity.")
-        method = st.selectbox("Anonymization method", OTHER_METHODS, key="other_method")
-        params = render_param_inputs(method, prefix="other")
-        threshold = st.slider("Matching threshold", 0.0, 1.0, float(pipeline.threshold), 0.01, key="other_threshold")
-        source_mode = st.radio("Image source", ["Dataset test image", "Bundled external sample", "Excluded LFW identity", "Upload image"], key="other_source_mode")
-        known_label = None
-        source_name = None
-        image_rgb = None
-        if source_mode == "Dataset test image":
-            image_rgb, known_label, source_name = choose_dataset_test_sample(pipeline, key="other_dataset_sample")
-        elif source_mode == "Bundled external sample":
-            bundled_label = st.selectbox("Bundled sample", list(BUNDLED_EXTERNAL_IMAGES.keys()), key="other_bundled_sample")
-            bundled_path = BUNDLED_EXTERNAL_IMAGES[bundled_label]
-            image_rgb = np.asarray(Image.open(bundled_path).convert("RGB"))
-            source_name = str(bundled_path)
-        elif source_mode == "Excluded LFW identity":
-            unknown_paths = pipeline.sample_unknown_paths(count=40)
-            selected_path = st.selectbox("Excluded LFW sample", [str(path) for path in unknown_paths], key="other_unknown_path")
-            image_rgb = np.asarray(Image.open(selected_path).convert("RGB"))
-            source_name = selected_path
-        else:
-            uploaded = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"], key="other_upload")
-            if uploaded is not None:
-                image_rgb = pil_to_rgb_array(Image.open(uploaded))
-                source_name = uploaded.name
-
-        if st.button("Run anonymization demo", key="other_run_button", type="primary", use_container_width=True) and image_rgb is not None:
-            with st.spinner("Running manual anonymization demo..."):
-                st.session_state["other_query_result"] = pipeline.query_image(
-                    image_rgb=image_rgb,
-                    method=method,
-                    params=params,
-                    known_label=known_label,
-                    threshold=threshold,
-                )
-                st.session_state["other_query_source"] = source_name
-        render_method_reference(method)
-
-    with right:
-        result = st.session_state.get("other_query_result")
-        if isinstance(result, QueryResult):
-            st.write(f"Source: `{st.session_state.get('other_query_source')}`")
-            render_query_result(result)
-            st.caption("Save anonymization demo writes a JSON summary into the experiments folder.")
-            if st.button("Save anonymization demo", key="other_save_button"):
-                saved = pipeline.save_experiment(
-                    "other_anonymization_demo",
-                    {
-                        "type": "other_anonymization_demo",
-                        "source": st.session_state.get("other_query_source"),
-                        "method": result.method,
-                        "predicted_label": result.predicted_label,
-                        "distance": result.predicted_distance,
-                    },
-                )
-                st.success(f"Saved to {saved}")
-
-
-def render_benchmark_section(pipeline: PrivacyFacePipeline) -> None:
-    render_section_header(
-        "Section 5",
-        "Automatic benchmark: run all main anonymization methods once, scan the parameter range, then save the results for later reopening.",
-    )
-    left, right = st.columns([1, 2])
-    with left:
-        st.info("This section is different from the manual demo: it automatically sweeps several methods and parameter ranges in one run, then saves the benchmark table.")
-        threshold = st.slider("Benchmark threshold", 0.0, 1.0, float(pipeline.threshold), 0.01, key="benchmark_threshold")
-        limit = st.slider("Benchmark sample count", 50, len(pipeline.test_idx), min(200, len(pipeline.test_idx)), 10, key="benchmark_limit")
-        if st.button("Run full benchmark", key="benchmark_run_button", type="primary", use_container_width=True):
-            with st.spinner("Running automatic benchmark across all selected anonymization methods..."):
-                frames: list[pd.DataFrame] = []
-                for method, config in BENCHMARK_CONFIGS.items():
-                    sweep = pipeline.run_parameter_sweep(
-                        method=method,
-                        parameter_name=config["parameter_name"],
-                        parameter_values=config["values"],
-                        base_params=config["base_params"],
-                        threshold=threshold,
-                        limit=limit,
-                    )
-                    sweep["threshold"] = threshold
-                    frames.append(sweep)
-                benchmark_df = pd.concat(frames, ignore_index=True)
-                st.session_state["benchmark_df"] = benchmark_df
-
-    with right:
-        benchmark_df = st.session_state.get("benchmark_df")
-        if isinstance(benchmark_df, pd.DataFrame):
-            st.dataframe(benchmark_df, use_container_width=True)
-            for method in BENCHMARK_CONFIGS:
-                method_df = benchmark_df[benchmark_df["method"] == method].copy()
-                st.markdown(f"**{method}**")
-                st.line_chart(method_df.set_index("parameter_value")[["top1_accuracy", "rejection_rate"]])
-            data, filename = dataframe_download(benchmark_df, "automatic_benchmark.csv")
-            st.download_button("Download benchmark CSV", data=data, file_name=filename, mime="text/csv")
-            st.caption("Save benchmark writes the benchmark table into the experiments folder.")
-            if st.button("Save benchmark", key="benchmark_save_button"):
-                saved = pipeline.save_experiment(
-                    "automatic_benchmark",
-                    {"type": "automatic_benchmark", "rows": benchmark_df.to_dict(orient="records")},
-                )
-                st.success(f"Saved to {saved}")
-
-
-def render_saved_results_section(pipeline: PrivacyFacePipeline) -> None:
-    render_section_header(
-        "Section 6",
-        "Reload saved experiments and exported results without recomputing embeddings or retraining the model.",
-    )
-    paths = pipeline.load_saved_experiments()
-    if not paths:
-        st.info("No saved experiments yet.")
-        return
-    selected = st.selectbox("Saved experiment", [str(path) for path in paths], key="saved_select")
-    content = json.loads(Path(selected).read_text(encoding="utf-8"))
-    st.json(content)
-
-
-def render_methods_section() -> None:
-    render_section_header(
-        "Section 7",
-        "Method notes for the next meeting: how each anonymization works, what to expect on utility/privacy, and the reference sources.",
-    )
-    for key, spec in METHOD_SPECS.items():
-        with st.expander(f"{spec.name} ({spec.space})", expanded=False):
-            st.write(spec.description)
-            if spec.default_params:
-                st.json(spec.default_params)
-            note = METHOD_NOTES.get(key)
-            if note:
-                st.markdown("**How it works**")
-                st.write(note["how_it_works"])
-                st.markdown("**Why use it**")
-                st.write(note["why_use_it"])
-                st.markdown("**Utility vs privacy**")
-                st.write(note["utility_privacy"])
-                st.markdown("**Sources**")
-                for source in note["sources"]:
-                    st.markdown(f"- [{source['label']}]({source['url']})")
 
 
 def main() -> None:
-    pipeline = get_pipeline()
+    init_ui_state()
+    try:
+        pipeline = get_pipeline()
+    except Exception:
+        tb = traceback.format_exc()
+        st.error("The application failed while loading the pipeline.")
+        with st.expander("Startup error details", expanded=True):
+            st.code(tb, language="python")
+        return
+
     with st.sidebar:
         st.title("Work Sections")
         section = st.radio(
             "Go to",
             [
-                "Overview",
                 "1. Known Users Accuracy",
                 "2. Unknown / OOD Check",
                 "3. Differential Privacy Sweeps",
-                "4. Other Anonymization Methods",
-                "5. Automatic Benchmark",
-                "6. Saved Results",
-                "7. Method Notes",
             ],
         )
-        st.caption("Heavy actions start only when you press a main button. A spinner appears while the computation is running. Save buttons write JSON summaries into the experiments folder.")
+        st.caption("Only the requested tasks are kept in this GUI. Heavy actions start only when you press a main button.")
+        render_activity_console()
 
-    if section == "Overview":
-        render_overview_section(pipeline)
-    elif section == "1. Known Users Accuracy":
+    render_overview_section(pipeline)
+
+    if section == "1. Known Users Accuracy":
         render_known_users_section(pipeline)
     elif section == "2. Unknown / OOD Check":
         render_unknown_section(pipeline)
-    elif section == "3. Differential Privacy Sweeps":
-        render_dp_section(pipeline)
-    elif section == "4. Other Anonymization Methods":
-        render_other_methods_section(pipeline)
-    elif section == "5. Automatic Benchmark":
-        render_benchmark_section(pipeline)
-    elif section == "6. Saved Results":
-        render_saved_results_section(pipeline)
     else:
-        render_methods_section()
+        render_dp_section(pipeline)
 
 
 if __name__ == "__main__":
