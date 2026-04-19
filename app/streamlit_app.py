@@ -4,6 +4,7 @@ import sys
 import time
 import traceback
 from datetime import datetime
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -110,6 +111,15 @@ METHOD_LABELS = {
     "embedding_dp_laplace": "Differential Privacy (Laplace on embedding)",
 }
 
+METHOD_GROUPS = {
+    "gaussian_blur": "Before ArcFace (photo-space)",
+    "embedding_noise": "After ArcFace (embedding-space)",
+    "embedding_dp_laplace": "After ArcFace (embedding-space)",
+    "random_projection": "After ArcFace (embedding-space)",
+    "quantization": "After ArcFace (embedding-space)",
+    "cancellable_transform": "After ArcFace (embedding-space)",
+}
+
 UI_PARAM_FIELDS = {
     "gaussian_blur": ["kernel_size"],
     "embedding_noise": ["sigma"],
@@ -122,6 +132,19 @@ UI_PARAM_FIELDS = {
 BUNDLED_EXTERNAL_IMAGES = {
     "Greta Thunberg (human, not in LFW)": PROJECT_ROOT / "sample_inputs" / "greta_thunberg_unknown.jpg",
     "Cat image (OOD animal sample)": PROJECT_ROOT / "sample_inputs" / "cat_ood.jpg",
+}
+
+CONCLUSION_SWEEP_CONFIGS = {
+    "gaussian_blur": {"parameter_name": "kernel_size", "values": [5, 11, 21, 31, 41, 61, 81], "base_params": {}},
+    "embedding_noise": {"parameter_name": "sigma", "values": [0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3], "base_params": {}},
+    "embedding_dp_laplace": {
+        "parameter_name": "epsilon",
+        "values": [32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5],
+        "base_params": {"sensitivity": 1.0},
+    },
+    "random_projection": {"parameter_name": "target_dim", "values": [512, 256, 128, 64, 32, 16], "base_params": {"seed": 42}},
+    "quantization": {"parameter_name": "levels", "values": [256, 128, 64, 32, 16, 8, 4], "base_params": {}},
+    "cancellable_transform": {"parameter_name": "mix_ratio", "values": [0.2, 0.4, 0.6, 0.8, 1.0], "base_params": {"seed": 42}},
 }
 
 
@@ -201,6 +224,184 @@ def add_overall_success_rate(df: pd.DataFrame) -> pd.DataFrame:
     if {"top1_accuracy", "rejection_rate"}.issubset(enriched.columns):
         enriched["overall_success_rate"] = enriched["top1_accuracy"] * (1.0 - enriched["rejection_rate"])
     return enriched
+
+
+def format_parameter_value(value: float | int) -> str:
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{float(value):.3f}"
+
+
+def compute_operating_point_summary(benchmark_df: pd.DataFrame, target_utility: float) -> pd.DataFrame:
+    if benchmark_df.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, str | float | int | bool]] = []
+    for method, method_df in benchmark_df.groupby("method"):
+        eligible = method_df[method_df["overall_success_rate"] >= target_utility].copy()
+        feasible = not eligible.empty
+        source_df = eligible if feasible else method_df.copy()
+        source_df = source_df.sort_values(
+            by=["unknown_rejection_rate", "overall_success_rate"],
+            ascending=[False, False],
+        )
+        best = source_df.iloc[0]
+        rows.append(
+            {
+                "method": method_label(method),
+                "raw_method": method,
+                "parameter_name": str(best["parameter_name"]),
+                "parameter_value": best["parameter_value"],
+                "parameter_display": f"{best['parameter_name']}={format_parameter_value(best['parameter_value'])}",
+                "overall_success_rate": float(best["overall_success_rate"]),
+                "unknown_rejection_rate": float(best["unknown_rejection_rate"]),
+                "top1_accuracy": float(best["top1_accuracy"]),
+                "rejection_rate": float(best["rejection_rate"]),
+                "feasible_at_target_utility": feasible,
+                "has_formal_privacy_guarantee": method == "embedding_dp_laplace",
+            }
+        )
+
+    summary_df = pd.DataFrame(rows)
+    if summary_df.empty:
+        return summary_df
+    return summary_df.sort_values(
+        by=["feasible_at_target_utility", "unknown_rejection_rate", "overall_success_rate"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def build_conclusion_text(summary_df: pd.DataFrame, target_utility: float) -> str:
+    if summary_df.empty:
+        return "No comparison results are available yet."
+
+    feasible = summary_df[summary_df["feasible_at_target_utility"] == True]  # noqa: E712
+    dp_rows = summary_df[summary_df["raw_method"] == "embedding_dp_laplace"]
+    if feasible.empty:
+        best = summary_df.iloc[0]
+        text = (
+            f"No method reached the target utility level of {target_utility:.2f}. "
+            f"The closest operating point was {best['method']} with {best['parameter_display']}, "
+            f"overall success rate {best['overall_success_rate']:.3f}, and unknown rejection rate {best['unknown_rejection_rate']:.3f}."
+        )
+        if not dp_rows.empty:
+            dp_row = dp_rows.iloc[0]
+            text += (
+                f" Differential Privacy remained below the utility target in this benchmark. "
+                f"Its strongest tested point was epsilon={format_parameter_value(dp_row['parameter_value'])}, "
+                f"with overall success rate {dp_row['overall_success_rate']:.3f} and unknown rejection rate {dp_row['unknown_rejection_rate']:.3f}."
+            )
+        return text
+
+    best = feasible.iloc[0]
+    conclusion = (
+        f"For the chosen utility target ({target_utility:.2f} overall success rate), among the methods that reached this utility level, "
+        f"the best empirical privacy proxy is "
+        f"{best['method']} with {best['parameter_display']}. "
+        f"At this operating point, the overall success rate is {best['overall_success_rate']:.3f} "
+        f"and the unknown rejection rate is {best['unknown_rejection_rate']:.3f}."
+    )
+    if not dp_rows.empty:
+        dp_row = dp_rows.iloc[0]
+        if bool(dp_row["feasible_at_target_utility"]):
+            conclusion += (
+                f" Differential Privacy is the only method here with a formal privacy parameter (epsilon). "
+                f"In this benchmark, its best feasible point is epsilon={format_parameter_value(dp_row['parameter_value'])}, "
+                f"with overall success rate {dp_row['overall_success_rate']:.3f} and unknown rejection rate {dp_row['unknown_rejection_rate']:.3f}."
+            )
+        else:
+            conclusion += (
+                f" Differential Privacy is the only method here with a formal privacy parameter (epsilon), "
+                f"but in this benchmark it did not reach the target utility level. "
+                f"Its best tested point was epsilon={format_parameter_value(dp_row['parameter_value'])}, "
+                f"with overall success rate {dp_row['overall_success_rate']:.3f} and unknown rejection rate {dp_row['unknown_rejection_rate']:.3f}."
+            )
+    return conclusion
+
+
+def make_tradeoff_scatter_figure(benchmark_df: pd.DataFrame):
+    figure, axis = plt.subplots(figsize=(7, 5))
+    for method, method_df in benchmark_df.groupby("method"):
+        axis.scatter(
+            method_df["overall_success_rate"],
+            method_df["unknown_rejection_rate"],
+            label=method_label(method),
+            s=70,
+            alpha=0.85,
+        )
+    axis.set_xlabel("Overall success rate (utility)")
+    axis.set_ylabel("Unknown rejection rate (privacy proxy)")
+    axis.set_title("Utility vs privacy trade-off")
+    axis.set_xlim(0.0, 1.02)
+    axis.set_ylim(0.0, 1.02)
+    axis.grid(alpha=0.25)
+    axis.legend(loc="best", fontsize=8)
+    return figure
+
+
+def make_method_curve_figure(benchmark_df: pd.DataFrame):
+    methods = list(benchmark_df["method"].unique())
+    figure, axes = plt.subplots(len(methods), 1, figsize=(8, max(3.0 * len(methods), 4.0)), squeeze=False)
+    for axis, method in zip(axes.flat, methods):
+        method_df = benchmark_df[benchmark_df["method"] == method].copy()
+        method_df = method_df.sort_values("parameter_value")
+        labels = [format_parameter_value(value) for value in method_df["parameter_value"].tolist()]
+        axis.plot(labels, method_df["overall_success_rate"], marker="o", label="overall success")
+        axis.plot(labels, method_df["unknown_rejection_rate"], marker="s", label="unknown rejection")
+        axis.set_ylim(0.0, 1.02)
+        axis.set_title(method_label(method))
+        axis.set_ylabel("score")
+        axis.grid(alpha=0.25)
+        axis.legend(loc="best", fontsize=8)
+    axes.flat[-1].set_xlabel("parameter value")
+    figure.tight_layout()
+    return figure
+
+
+def make_best_method_bar_figure(summary_df: pd.DataFrame):
+    figure, axis = plt.subplots(figsize=(8, 4.5))
+    plot_df = summary_df.copy()
+    plot_df = plot_df.sort_values("unknown_rejection_rate", ascending=False)
+    x = np.arange(len(plot_df))
+    width = 0.38
+    axis.bar(x - width / 2, plot_df["overall_success_rate"], width=width, label="overall success")
+    axis.bar(x + width / 2, plot_df["unknown_rejection_rate"], width=width, label="unknown rejection")
+    axis.set_xticks(x)
+    axis.set_xticklabels(plot_df["method"], rotation=20, ha="right")
+    axis.set_ylim(0.0, 1.02)
+    axis.set_ylabel("score")
+    axis.set_title("Best operating point per method")
+    axis.grid(axis="y", alpha=0.25)
+    axis.legend(loc="best")
+    figure.tight_layout()
+    return figure
+
+
+def latest_conclusion_experiment(pipeline: PrivacyFacePipeline) -> dict | None:
+    for path in pipeline.load_saved_experiments():
+        if "conclusion-benchmark" not in path.name and "conclusion_benchmark" not in path.name:
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("type") == "conclusion_benchmark":
+            payload["_path"] = str(path)
+            return payload
+    docs_fallback = PROJECT_ROOT / "docs" / "data" / "conclusion_benchmark_summary.json"
+    if docs_fallback.exists():
+        payload = json.loads(docs_fallback.read_text(encoding="utf-8"))
+        payload["_path"] = str(docs_fallback)
+        return payload
+    return None
+
+
+def load_arcface_training_comparison() -> dict | None:
+    path = PROJECT_ROOT / "docs" / "data" / "arcface_training_comparison.json"
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["_path"] = str(path)
+    return payload
 
 
 def init_ui_state() -> None:
@@ -377,8 +578,8 @@ def render_overview_section(pipeline: PrivacyFacePipeline) -> None:
     st.markdown('<div class="hero">', unsafe_allow_html=True)
     st.title("Privacy-Preserving Face Recognition")
     st.write(
-        "This interface is limited to the three requested tasks: known-user matching accuracy, unknown or OOD rejection, "
-        "and differential privacy sweeps over epsilon."
+        "This interface is organized around the requested experiments: known-user matching accuracy, unknown or OOD rejection, "
+        "differential privacy sweeps over epsilon, and a final conclusion section comparing utility/privacy trade-offs."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -684,14 +885,137 @@ def render_dp_section(pipeline: PrivacyFacePipeline) -> None:
     with right:
         sweep_df = st.session_state.get("dp_sweep_df")
         if isinstance(sweep_df, pd.DataFrame):
+            sweep_df = add_overall_success_rate(sweep_df)
             st.dataframe(sweep_df, use_container_width=True)
-            st.line_chart(sweep_df.set_index("epsilon")[["known_top1_accuracy", "unknown_rejection_rate"]])
+            st.line_chart(sweep_df.set_index("epsilon")[["overall_success_rate", "known_top1_accuracy", "unknown_rejection_rate"]])
             data, filename = dataframe_download(sweep_df, "dp_sweep.csv")
             st.download_button("Download DP sweep CSV", data=data, file_name=filename, mime="text/csv")
             st.caption("Save result writes the DP epsilon sweep into the experiments folder.")
             if st.button("Save DP sweep", key="dp_save_button"):
                 saved = pipeline.save_experiment("dp_sweep", st.session_state["dp_sweep_payload"])
                 st.success(f"Saved to {saved}")
+
+
+def render_conclusion_section(pipeline: PrivacyFacePipeline) -> None:
+    render_section_header(
+        "Section 4",
+        "Conclusion: for a given utility level, compare the methods and identify which one gives the strongest privacy protection in the current experiments.",
+    )
+    payload = latest_conclusion_experiment(pipeline)
+    if payload is None:
+        st.warning("No saved conclusion benchmark found yet. Run the benchmark once to populate this page.")
+        return
+
+    benchmark_df = pd.DataFrame(payload.get("rows", []))
+    summary_df = pd.DataFrame(payload.get("summary_rows", []))
+    conclusion_text = payload.get("conclusion_text", "")
+    target_utility = float(payload.get("target_utility", 0.8))
+    threshold = float(payload.get("threshold", pipeline.threshold))
+    known_limit = int(payload.get("known_limit", 20))
+    unknown_count = int(payload.get("unknown_count", 20))
+    source_path = payload.get("_path", "")
+
+    render_section_header(
+        "Methodology",
+        "All methods are compared under the same evaluation protocol. Utility is measured with overall success rate, and privacy is approximated with unknown-user rejection.",
+    )
+    metric_cols = st.columns(5)
+    metric_values = [
+        ("Methods compared", str(benchmark_df["method"].nunique())),
+        ("Operating points", str(len(benchmark_df))),
+        ("Known-user tests", str(known_limit)),
+        ("Unknown-user tests", str(unknown_count)),
+        ("Target utility", f"{target_utility:.2f}"),
+    ]
+    for col, (label, value) in zip(metric_cols, metric_values):
+        with col:
+            render_metric_card(label, value)
+
+    st.caption(f"Benchmark source: `{source_path}`")
+    st.caption(
+        f"Common settings used in the saved benchmark: threshold={threshold:.3f}. "
+        "Unknown-user privacy is evaluated on excluded LFW identities. Bundled OOD samples remain qualitative demo cases."
+    )
+
+    st.markdown("**What was tested**")
+    tested_rows = []
+    for method, config in CONCLUSION_SWEEP_CONFIGS.items():
+        tested_rows.append(
+            {
+                "method": method_label(method),
+                "applied_to": METHOD_GROUPS.get(method, "Unknown"),
+                "parameter": config["parameter_name"],
+                "tested_values": ", ".join(format_parameter_value(value) for value in config["values"]),
+            }
+        )
+    st.dataframe(pd.DataFrame(tested_rows), use_container_width=True)
+
+    if not benchmark_df.empty:
+        st.markdown("**Results overview**")
+        chart_left, chart_right = st.columns(2)
+        with chart_left:
+            st.pyplot(make_tradeoff_scatter_figure(benchmark_df), clear_figure=True)
+        with chart_right:
+            st.pyplot(make_best_method_bar_figure(summary_df), clear_figure=True)
+
+        st.markdown("**Method curves**")
+        st.pyplot(make_method_curve_figure(benchmark_df), clear_figure=True)
+
+        st.markdown("**Best operating point per method**")
+        st.dataframe(
+            summary_df[
+                [
+                    "method",
+                    "parameter_display",
+                    "overall_success_rate",
+                    "unknown_rejection_rate",
+                    "feasible_at_target_utility",
+                    "has_formal_privacy_guarantee",
+                ]
+            ],
+            use_container_width=True,
+        )
+
+    if conclusion_text:
+        st.markdown("**Conclusion**")
+        st.success(conclusion_text)
+        st.info(
+            "Interpretation: at the same utility level, the best experimental method is the one with the highest unknown-user rejection. "
+            "Differential Privacy must also be discussed separately because it is the only method here with a formal privacy parameter, epsilon."
+        )
+
+    training_payload = load_arcface_training_comparison()
+    if training_payload is not None:
+        comparison_df = pd.DataFrame(training_payload.get("comparison", []))
+        protocol = training_payload.get("training_protocol", {})
+        if not comparison_df.empty:
+            render_section_header(
+                "Pre-trained vs trained",
+                "Comparison between the frozen pre-trained ArcFace pipeline and a lightweight dataset-adapted ArcFace-style head trained on the filtered LFW subset.",
+            )
+            st.caption(protocol.get("note", ""))
+            metric_cols = st.columns(4)
+            with metric_cols[0]:
+                render_metric_card("Train samples", str(protocol.get("train_samples", "-")))
+            with metric_cols[1]:
+                render_metric_card("Test samples", str(protocol.get("test_samples", "-")))
+            with metric_cols[2]:
+                render_metric_card("Epochs", str(protocol.get("epochs", "-")))
+            with metric_cols[3]:
+                render_metric_card("Device", str(protocol.get("device", "-")))
+
+            display_df = comparison_df.copy()
+            st.dataframe(display_df, use_container_width=True)
+
+            comparison_plot = PROJECT_ROOT / "docs" / "assets" / "arcface_training_comparison.png"
+            training_plot = PROJECT_ROOT / "docs" / "assets" / "arcface_style_training_curve.png"
+            plot_cols = st.columns(2)
+            with plot_cols[0]:
+                if comparison_plot.exists():
+                    st.image(str(comparison_plot), caption="Model comparison", use_container_width=True)
+            with plot_cols[1]:
+                if training_plot.exists():
+                    st.image(str(training_plot), caption="ArcFace-style adaptation training curve", use_container_width=True)
 
 
 def main() -> None:
@@ -713,9 +1037,10 @@ def main() -> None:
                 "1. Known Users Accuracy",
                 "2. Unknown / OOD Check",
                 "3. Differential Privacy Sweeps",
+                "4. Conclusion",
             ],
         )
-        st.caption("Only the requested tasks are kept in this GUI. Heavy actions start only when you press a main button.")
+        st.caption("Heavy actions start only when you press a main button. The last section compares methods and produces a conclusion.")
         render_activity_console()
 
     render_overview_section(pipeline)
@@ -724,8 +1049,10 @@ def main() -> None:
         render_known_users_section(pipeline)
     elif section == "2. Unknown / OOD Check":
         render_unknown_section(pipeline)
-    else:
+    elif section == "3. Differential Privacy Sweeps":
         render_dp_section(pipeline)
+    else:
+        render_conclusion_section(pipeline)
 
 
 if __name__ == "__main__":

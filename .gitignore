@@ -16,6 +16,10 @@ data_lfw_funneled.tgz
 !artifacts/.gitkeep
 !experiments/.gitkeep
 !results/.gitkeep
+!docs/data/
+!docs/data/**
+!docs/assets/
+!docs/assets/**
 
 sample_inputs/*.tmp
 notebooks/

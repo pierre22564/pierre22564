@@ -1,0 +1,36 @@
+{
+  "training_protocol": {
+    "dataset": "LFW filtered with min_faces_per_person=20",
+    "num_identities": 62,
+    "num_images": 3023,
+    "train_samples": 2116,
+    "test_samples": 907,
+    "epochs": 40,
+    "batch_size": 128,
+    "embedding_dim": 128,
+    "device": "cpu",
+    "note": "This is a lightweight dataset-specific ArcFace-style adaptation trained on top of frozen pre-trained ArcFace embeddings, not a full retraining of the original ArcFace backbone."
+  },
+  "comparison": [
+    {
+      "model_name": "Pre-trained ArcFace",
+      "top1_accuracy": 0.9698025551684089,
+      "rejection_rate": 0.050716648291069456,
+      "overall_success_rate": 0.9206174200661521,
+      "mean_distance": 0.36827133075142116,
+      "threshold": 0.5399157047271728,
+      "num_samples": 907,
+      "embedding_dim": 512
+    },
+    {
+      "model_name": "Dataset-adapted ArcFace head",
+      "top1_accuracy": 1.0,
+      "rejection_rate": 0.050716648291069456,
+      "overall_success_rate": 0.9492833517089305,
+      "mean_distance": 0.16305437608485449,
+      "threshold": 0.37868714928627,
+      "num_samples": 907,
+      "embedding_dim": 128
+    }
+  ]
+}

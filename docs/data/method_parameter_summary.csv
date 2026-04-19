@@ -1,0 +1,7 @@
+method,applied_to,parameter_name,tested_values
+Gaussian Blur,Before ArcFace (photo-space),kernel_size,"5, 11, 21, 31, 41, 61, 81"
+Noise Injection,After ArcFace (embedding-space),sigma,"0.010, 0.030, 0.050, 0.100, 0.150, 0.200, 0.300"
+Differential Privacy,After ArcFace (embedding-space),epsilon,"32, 16, 8, 4, 2, 1, 0.500"
+Random Projection,After ArcFace (embedding-space),target_dim,"512, 256, 128, 64, 32, 16"
+Quantization,After ArcFace (embedding-space),levels,"256, 128, 64, 32, 16, 8, 4"
+Cancellable Transformation,After ArcFace (embedding-space),mix_ratio,"0.200, 0.400, 0.600, 0.800, 1"

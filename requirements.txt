@@ -9,3 +9,5 @@ jupyter
 streamlit
 joblib
 pillow
+torch
+torchvision

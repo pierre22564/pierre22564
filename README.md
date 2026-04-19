@@ -1,16 +1,28 @@
 # Privacy-Preserving Face Recognition
 
-Face-recognition project built around ArcFace, LFW, anonymization at the image or embedding level, known-user matching, unknown-user rejection, and differential privacy sweeps.
+Face-recognition project built around ArcFace, LFW, anonymization at the image or embedding level, known-user matching, unknown-user rejection, differential privacy sweeps, and a final utility/privacy conclusion benchmark.
+
+## Documentation Pages
+
+The GitHub-page-ready documentation is split into separate pages inside `docs/`:
+
+- `docs/index.md`
+- `docs/project_scope.md`
+- `docs/scientific_summary.md`
+- `docs/installation.md`
+- `docs/results_and_conclusions.md`
 
 ## Main entry points
 
 - `app/streamlit_app.py`: global user interface
 - `notebooks/01_dataset_arcface_milestone.ipynb`: original notebook
 - `docs/anonymization_methods.md`: slide-ready method notes
+- `scripts/run_conclusion_benchmark.py`: benchmark used for the final conclusion section
+- `scripts/train_arcface_style.py`: dataset-adapted ArcFace-style comparison experiment
 
 ## What the app does
 
-The Streamlit GUI is intentionally limited to the three requested tasks:
+The Streamlit GUI is organized into four sections:
 
 - `1. Known Users Accuracy`
   - run one sample match
@@ -23,11 +35,17 @@ The Streamlit GUI is intentionally limited to the three requested tasks:
 - `3. Differential Privacy Sweeps`
   - evaluate Laplace noise on embeddings for several `epsilon` values
   - compare utility on known users and rejection on unknown users
+- `4. Conclusion`
+  - load the latest benchmark summary
+  - show the methodology and tested parameter ranges
+  - display utility/privacy plots and the final suggested method
+  - compare frozen pre-trained ArcFace with a dataset-adapted ArcFace-style head
 
 Available anonymization methods in the GUI:
 
 - Gaussian blur
 - Noise injection
+- Differential privacy on embeddings
 - Random projection
 - Quantization
 - Cancellable transformation
@@ -67,6 +85,20 @@ Then run:
 streamlit run app/streamlit_app.py
 ```
 
+## Optional Experimental Scripts
+
+Run the conclusion benchmark:
+
+```bash
+python3 scripts/run_conclusion_benchmark.py
+```
+
+Run the dataset-adapted ArcFace-style comparison:
+
+```bash
+python3 scripts/train_arcface_style.py
+```
+
 ## Bundled external samples
 
 The repo includes two ready-to-use samples for the unknown / OOD section:
@@ -78,11 +110,16 @@ The repo includes two ready-to-use samples for the unknown / OOD section:
 
 Generated runtime files are stored in:
 
-- `artifacts/`: embeddings cache and classifier cache
+- `artifacts/`: local caches and local trained adaptation weights
 - `experiments/`: saved experiment JSON files
-- `results/`: exported result tables or plots
+- `results/`: local CSV outputs
 
-These folders are excluded from Git by default.
+Tracked documentation artifacts are stored in:
+
+- `docs/data/`: JSON and CSV-style summaries used by the docs and GUI
+- `docs/assets/`: figures used in the GitHub pages and result summaries
+
+These heavy runtime folders are excluded from Git by default, except for the tracked docs files.
 
 ## Project structure
 
@@ -92,9 +129,11 @@ These folders are excluded from Git by default.
 - `src/privacy_face_gui/anonymization.py`: anonymization methods
 - `src/privacy_face_gui/method_notes.py`: scientific notes and references
 - `src/privacy_face_gui/pipeline.py`: caching, evaluation, matching, persistence
+- `docs/`: GitHub-page-ready documentation
 
 ## Notes
 
 - The GUI uses cached embeddings and a cached classifier when available.
 - If you want a fresh recomputation, delete the files inside `artifacts/`.
 - The slide notes for the anonymization methods are in `docs/anonymization_methods.md`.
+- The “trained ArcFace” experiment in this repository is a lightweight ArcFace-style adaptation trained on top of frozen ArcFace embeddings. It is not a full retraining of the original large ArcFace backbone.
